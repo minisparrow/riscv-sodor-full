@@ -1,0 +1,260 @@
+//**************************************************************************
+// RISCV Processor 2-Stage Datapath
+//--------------------------------------------------------------------------
+//
+// Christopher Celio
+// 2012 Jan 13
+
+package Sodor
+{
+
+import chisel3._
+import chisel3.util.{MuxCase, MuxLookup, Cat, Fill}
+
+import Constants._
+import Common.{Str, SodorConfiguration, MemPortIo, CSRFile, Causes}
+import Common.Constants.START_ADDR
+
+class DatToCtlIo(implicit val conf: SodorConfiguration) extends Bundle() 
+{
+   val inst  = Output(UInt(32.W))
+   val br_eq = Output(Bool())
+   val br_lt = Output(Bool())
+   val br_ltu= Output(Bool())
+   val ma_ls = Output(Bool())
+}
+
+class DpathIo(implicit val conf: SodorConfiguration) extends Bundle() 
+{
+   val imem = new MemPortIo(conf.xprlen)
+   val dmem = new MemPortIo(conf.xprlen)
+   val ctl  = Flipped(new CtlToDatIo())
+   val dat  = new DatToCtlIo()
+}
+
+class DatPath(implicit conf: SodorConfiguration) extends Module
+{
+   val io = IO(new DpathIo())
+   io := DontCare
+
+   //**********************************
+   // Pipeline State Registers
+   val if_reg_pc = RegInit(START_ADDR) 
+   
+   val exe_reg_pc       = RegInit(0.U(conf.xprlen.W))
+   val exe_reg_pc_plus4 = RegInit(0.U(conf.xprlen.W))
+   val exe_reg_inst     = RegInit(BUBBLE)
+   
+   //**********************************
+   // Instruction Fetch Stage
+   val if_pc_next          = Wire(UInt(32.W))
+   val exe_br_target       = Wire(UInt(32.W))
+   val exe_jmp_target      = Wire(UInt(32.W))
+   val exe_jump_reg_target = Wire(UInt(32.W))
+   val exception_target    = Wire(UInt(32.W))
+   val xcpt                = Wire(Bool())
+ 
+   when (!io.ctl.stall)
+   {
+      if_reg_pc := Mux(xcpt, exception_target, if_pc_next)
+   }
+
+   val if_pc_plus4 = (if_reg_pc + 4.U(conf.xprlen.W))               
+
+   if_pc_next := MuxCase(if_pc_plus4, Array(
+                  (io.ctl.pc_sel === PC_4)  -> if_pc_plus4,
+                  (io.ctl.pc_sel === PC_BR) -> exe_br_target,
+                  (io.ctl.pc_sel === PC_J ) -> exe_jmp_target,
+                  (io.ctl.pc_sel === PC_JR) -> exe_jump_reg_target
+                  ))
+   
+   //Instruction Memory
+   io.imem.req.bits.addr := if_reg_pc
+   val if_inst = io.imem.resp.bits.data
+                 
+   when(io.ctl.stall) 
+   {
+      exe_reg_inst := exe_reg_inst
+      exe_reg_pc   := exe_reg_pc
+   }
+   .elsewhen(io.ctl.if_kill || xcpt) 
+   {
+      exe_reg_inst := BUBBLE
+      exe_reg_pc   := 0.U
+   } 
+   .otherwise 
+   {
+      exe_reg_inst := if_inst
+      exe_reg_pc   := if_reg_pc
+   }
+
+   exe_reg_pc_plus4 := if_pc_plus4
+   
+   //**********************************
+   // Execute Stage
+   val exe_rs1_addr = exe_reg_inst(RS1_MSB, RS1_LSB)
+   val exe_rs2_addr = exe_reg_inst(RS2_MSB, RS2_LSB)
+   val exe_wbaddr   = exe_reg_inst(RD_MSB,  RD_LSB)
+   
+   val exe_wbdata = Wire(UInt(conf.xprlen.W))
+ 
+   // Register File
+   val regfile = Mem(32,UInt(conf.xprlen.W))
+
+   when (io.ctl.rf_wen && !xcpt)
+   {
+      regfile(exe_wbaddr) := exe_wbdata
+   }
+
+   val exe_rs1_data = Mux((exe_rs1_addr =/= 0.U), regfile(exe_rs1_addr), 0.U)
+   val exe_rs2_data = Mux((exe_rs2_addr =/= 0.U), regfile(exe_rs2_addr), 0.U)
+   
+   
+   // immediates
+   val imm_i = exe_reg_inst(31, 20) 
+   val imm_s = Cat(exe_reg_inst(31, 25), exe_reg_inst(11,7))
+   val imm_b = Cat(exe_reg_inst(31), exe_reg_inst(7), exe_reg_inst(30,25), exe_reg_inst(11,8))
+   val imm_u = exe_reg_inst(31, 12)
+   val imm_j = Cat(exe_reg_inst(31), exe_reg_inst(19,12), exe_reg_inst(20), exe_reg_inst(30,21))
+   val imm_z = Cat(Fill(27,0.U), exe_reg_inst(19,15))
+
+   // sign-extend immediates
+   val imm_i_sext = Cat(Fill(20,imm_i(11)), imm_i)
+   val imm_s_sext = Cat(Fill(20,imm_s(11)), imm_s)
+   val imm_b_sext = Cat(Fill(19,imm_b(11)), imm_b, 0.U)
+   val imm_u_sext = Cat(imm_u, Fill(12,0.U))
+   val imm_j_sext = Cat(Fill(11,imm_j(19)), imm_j, 0.U)
+   
+   
+   val exe_alu_op1 = MuxCase(0.U, Array(
+               (io.ctl.op1_sel === OP1_RS1) -> exe_rs1_data,
+               (io.ctl.op1_sel === OP1_IMU) -> imm_u_sext,
+               (io.ctl.op1_sel === OP1_IMZ) -> imm_z
+               )).asUInt
+   
+   val exe_alu_op2 = MuxCase(0.U, Array(
+               (io.ctl.op2_sel === OP2_RS2) -> exe_rs2_data,
+               (io.ctl.op2_sel === OP2_PC)  -> exe_reg_pc,
+               (io.ctl.op2_sel === OP2_IMI) -> imm_i_sext,
+               (io.ctl.op2_sel === OP2_IMS) -> imm_s_sext
+               )).asUInt
+  
+
+   // ALU
+   val exe_alu_out   = Wire(UInt(conf.xprlen.W))
+   
+   val alu_shamt = exe_alu_op2(4,0).asUInt
+   
+   exe_alu_out := MuxCase(0.U, Array(
+                  (io.ctl.alu_fun === ALU_ADD)  -> (exe_alu_op1 + exe_alu_op2).asUInt,
+                  (io.ctl.alu_fun === ALU_SUB)  -> (exe_alu_op1 - exe_alu_op2).asUInt,
+                  (io.ctl.alu_fun === ALU_AND)  -> (exe_alu_op1 & exe_alu_op2).asUInt,
+                  (io.ctl.alu_fun === ALU_OR)   -> (exe_alu_op1 | exe_alu_op2).asUInt,
+                  (io.ctl.alu_fun === ALU_XOR)  -> (exe_alu_op1 ^ exe_alu_op2).asUInt,
+                  (io.ctl.alu_fun === ALU_SLT)  -> (exe_alu_op1.asSInt < exe_alu_op2.asSInt).asUInt,
+                  (io.ctl.alu_fun === ALU_SLTU) -> (exe_alu_op1 < exe_alu_op2).asUInt,
+                  (io.ctl.alu_fun === ALU_SLL)  -> ((exe_alu_op1 << alu_shamt)(conf.xprlen-1, 0)).asUInt,
+                  (io.ctl.alu_fun === ALU_SRA)  -> (exe_alu_op1.asSInt >> alu_shamt).asUInt,
+                  (io.ctl.alu_fun === ALU_SRL)  -> (exe_alu_op1 >> alu_shamt).asUInt,
+                  (io.ctl.alu_fun === ALU_COPY1)-> exe_alu_op1 
+                  ))
+
+   // Branch/Jump Target Calculation
+   exe_br_target       := exe_reg_pc + imm_b_sext
+   exe_jmp_target      := exe_reg_pc + imm_j_sext
+   exe_jump_reg_target := Cat(exe_alu_out(31,1), 0.U(1.W))
+   
+
+   // Control Status Registers
+   val csr = Module(new CSRFile())
+   csr.io := DontCare
+   csr.io.rw.addr  := exe_reg_inst(CSR_ADDR_MSB,CSR_ADDR_LSB)
+   csr.io.rw.cmd   := io.ctl.csr_cmd
+   csr.io.rw.wdata := exe_alu_out
+   val csr_out = csr.io.rw.rdata
+
+   csr.io.retire    := !io.ctl.stall && !io.ctl.if_kill
+   csr.io.pc        := exe_reg_pc
+   exception_target := csr.io.evec
+        
+   // Add your own uarch counters here!
+   csr.io.counters.foreach(_.inc := false.B)
+
+ 
+   // WB Mux
+   exe_wbdata := MuxCase(exe_alu_out, Array(
+                  (io.ctl.wb_sel === WB_ALU) -> exe_alu_out,
+                  (io.ctl.wb_sel === WB_MEM) -> io.dmem.resp.bits.data, 
+                  (io.ctl.wb_sel === WB_PC4) -> exe_reg_pc_plus4,
+                  (io.ctl.wb_sel === WB_CSR) -> csr_out
+                  ))
+                                  
+
+   // datapath to controlpath outputs
+   io.dat.inst   := exe_reg_inst
+   io.dat.br_eq  := (exe_rs1_data === exe_rs2_data)
+   io.dat.br_lt  := (exe_rs1_data.asSInt < exe_rs2_data.asSInt) 
+   io.dat.br_ltu := (exe_rs1_data.asUInt < exe_rs2_data.asUInt)
+   
+   
+   // datapath to data memory outputs
+   io.dmem.req.bits.addr := exe_alu_out
+   io.dmem.req.bits.data := exe_rs2_data.asUInt 
+
+   val ma_typ           = Wire(Bool())
+   val ma_load          = Wire(Bool())
+   val ma_str           = Wire(Bool())
+   val ma_instr         = Wire(Bool())
+   io.dat.ma_ls  := ma_load || ma_str
+   ma_typ        := MuxLookup(io.ctl.mem_typ(1,0) ,false.B, 
+                     Array( 2.U -> exe_alu_out(0), 3.U -> exe_alu_out(1,0).orR ))
+   ma_load      := io.ctl.mem_en && !io.ctl.mem_fcn && ma_typ
+   ma_str       := io.ctl.mem_en && io.ctl.mem_fcn && ma_typ
+   ma_instr     := if_pc_next(1,0).orR
+
+   csr.io.xcpt    := ma_load || ma_str || ma_instr || io.ctl.illegal
+   csr.io.cause   := MuxCase(0.U, Array(
+                     ma_instr -> Causes.misaligned_fetch.U,
+                     io.ctl.illegal -> Causes.illegal_instruction.U,
+                     ma_load -> Causes.misaligned_load.U,
+                     ma_str  -> Causes.misaligned_store.U ))
+   csr.io.tval    := MuxCase(0.U, Array(
+                     ma_instr -> if_pc_next,
+                     io.ctl.illegal -> exe_reg_inst,
+                     ma_load -> exe_alu_out,
+                     ma_str  -> exe_alu_out ))
+   xcpt := ma_instr  || ma_load || ma_str || io.ctl.illegal || csr.io.eret      
+
+   // Time Stamp Counter & Retired Instruction Counter 
+   val tsc_reg = RegInit(0.U(conf.xprlen.W))
+   tsc_reg := tsc_reg + 1.U
+
+   val irt_reg = RegInit(0.U(conf.xprlen.W))
+   when (!io.ctl.stall && !io.ctl.if_kill) { irt_reg := irt_reg + 1.U }
+        
+   
+   // Printout
+   printf("Cyc= %d Op1=[0x%x] Op2=[0x%x] W[%c,%d= 0x%x] PC= (0x%x,0x%x) [%x,%x] %c%c%c Exe: DASM(%x)\n"
+      , tsc_reg(31,0)
+      , exe_alu_op1
+      , exe_alu_op2
+      , Mux(io.ctl.rf_wen, Str("W"), Str("_"))
+      , exe_wbaddr
+      , exe_wbdata
+      , if_reg_pc
+      , exe_reg_pc
+      , if_inst(6,0)
+      , exe_reg_inst(6,0)
+      , Mux(io.ctl.stall, Str("S"), Str(" ")) //stall -> S
+      , Mux(io.ctl.if_kill, Str("K"), Str(" ")) // Kill -> K
+      , Mux(io.ctl.pc_sel  === 1.U, Str("B"), // BR -> B
+         Mux(io.ctl.pc_sel === 2.U, Str("J"),
+         Mux(io.ctl.pc_sel === 3.U, Str("R"),  // JR -> R
+         Mux(io.ctl.pc_sel === 4.U, Str("E"),  // EX -> E
+         Mux(io.ctl.pc_sel === 0.U, Str(" "), Str("?"))))))
+      , exe_reg_inst
+      )
+}
+
+ 
+}

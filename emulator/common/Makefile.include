@@ -1,0 +1,195 @@
+all: emulator
+
+RISCV           := /opt/riscv
+srcDir          := $(abspath ../../)
+buildLibDir     := $(RISCV)/lib
+buildDir        := $(abspath ../../)
+
+CXX := g++
+SBT := java -Xmx4096M -Xss8M -XX:MaxPermSize=128M -jar $(srcDir)/sbt-launch.jar $(SBT_FLAGS)
+
+common      := $(srcDir)/emulator/common
+install     := $(srcDir)/install
+
+ELF         := elf2hex
+
+# pipe processor output through the spike-dasm program to turn 
+# raw instruction bits into pretty, readable diassembly
+disasm_exe := 2>
+which_disasm := $(shell which spike-dasm)
+ifneq ($(which_disasm),)
+	disasm_exe := 3>&1 1>&2 2>&3 | $(which_disasm) $(DISASM_EXTENSION) >
+endif
+
+MK_TARGET_PROC?=rv32_1stage
+ 
+ifneq ($(shell which pkg-config),)
+	ifneq ($(shell pkg-config --variable=includedir verilator),)
+		VERILATOR_INCLUDE=$(shell pkg-config --variable=includedir verilator)
+	else
+		ifneq ($(wildcard $(VERILATOR_ROOT)/include/vltstd/vpi_user.h),)
+			VERILATOR_INCLUDE=$(VERILATOR_ROOT)/include/
+		else
+			$(error VERILATOR_ROOT is set to $(VERILATOR_ROOT) but not finding expected_file in there.)
+		endif
+	endif
+else
+	ifneq ($(wildcard $(VERILATOR_ROOT)/include/vltstd/vpi_user.h),)
+		VERILATOR_INCLUDE=$(VERILATOR_ROOT)/include/
+	else
+		$(error VERILATOR_ROOT is set to $(VERILATOR_ROOT) but not finding expected_file in there.)
+	endif
+endif
+ 
+CXXFLAGS := $(CXXFLAGS) -O1 -std=c++11  -g
+
+CXXSRCS := SimDTM
+CXXFLAGS := $(CXXFLAGS) -I$(srcDir)/emulator/common -I$(srcDir)/riscv-fesvr
+CXXDEBUGFLAGS := -DDEBUG
+
+LDFLAGS := $(LDFLAGS) -L$(buildLibDir) -Wl,-rpath,$(buildLibDir) -L. -lpthread
+OBJS := $(addsuffix .o,$(CXXSRCS))
+DEBUG_OBJS := $(addsuffix -debug.o,$(CXXSRCS))
+
+CHISEL_ARGS := -td emulator/${MK_TARGET_PROC}/generated-src
+CHISEL_ARGS_DEBUG := 
+
+# To find emulator.cpp
+vpath %.cpp  $(srcDir)/emulator/$(MK_TARGET_PROC) 
+vpath %.cc 	$(srcDir)/riscv-fesvr/fesvr $(srcDir)/emulator/common
+vpath %.h 	$(srcDir)/riscv-fesvr/fesvr $(srcDir)/emulator/common
+vpath %.a    $(buildLibDir) 
+vpath %.v 	$(srcDir)/vsrc
+vpath %.sv 	$(srcDir)/vsrc
+
+generated-src/Top.v: $(srcDir)/src/${MK_TARGET_PROC}/*.scala $(srcDir)/src/common/*.scala
+	cd $(buildDir) && $(SBT) "project ${MK_TARGET_PROC}" "run $(CHISEL_ARGS)"
+
+$(addsuffix .o,$(CXXSRCS)): %.o: $(srcDir)/emulator/common/%.cc
+	$(CXX) $(CXXFLAGS) -I${VERILATOR_INCLUDE} -c -o $@ $<
+
+generated_dir = $(srcDir)/emulator/${MK_TARGET_PROC}
+
+# Run Verilator to produce a fast binary to emulate this circuit.
+VERILATOR := verilator --cc --exe 
+VERILATOR_FLAGS := --top-module Top \
+  +define+PRINTF_COND=\$$c\(\"verbose\"\) \
+  --assert \
+  --output-split 20000 \
+	--x-assign unique \
+  -I$(srcDir)/vsrc \
+  -O3 -CFLAGS "$(CXXFLAGS) $(LDFLAGS) -DVERILATOR -include $(srcDir)/emulator/common/verilator.h"
+emulator: generated-src/Top.v $(srcDir)/emulator/common/emulator.cpp SimDTM.o $(srcDir)/vsrc/AsyncReadMem.sv $(srcDir)/vsrc/SyncMem.sv $(srcDir)/vsrc/SimDTM.v
+	$(VERILATOR) $(VERILATOR_FLAGS) \
+	-o $(generated_dir)/$@ $< $(srcDir)/vsrc/SimDTM.v -LDFLAGS "$(LDFLAGS)" $(srcDir)/emulator/common/emulator.cpp $(srcDir)/riscv-fesvr/build/libfesvr.so $(generated_dir)/SimDTM.o
+	$(MAKE) -C $(generated_dir)/obj_dir -f VTop.mk
+
+emulator-debug: generated-src/Top.v $(srcDir)/emulator/common/emulator.cpp SimDTM.o $(srcDir)/vsrc/AsyncReadMem.sv $(srcDir)/vsrc/SyncMem.sv $(srcDir)/vsrc/SimDTM.v
+	$(VERILATOR) $(VERILATOR_FLAGS) --trace \
+	-o $(generated_dir)/$@ $< $(srcDir)/vsrc/SimDTM.v -LDFLAGS "$(LDFLAGS)" $(srcDir)/emulator/common/emulator.cpp $(srcDir)/riscv-fesvr/build/libfesvr.so $(generated_dir)/SimDTM.o
+	$(MAKE) -C $(generated_dir)/obj_dir -f VTop.mk
+ 
+clean:
+	rm -rf *.o *.a emulator obj_dir emulator-debug generated-src generated-src-debug DVEfiles output
+
+#--------------------------------------------------------------------
+# Tests
+#--------------------------------------------------------------------
+
+# Globally installed assembly tests
+global_tstdir = $(srcDir)/riscv-tests/isa
+
+global_asm_tests += \
+	rv32ui-p-simple \
+	rv32ui-p-add \
+	rv32ui-p-addi \
+	rv32ui-p-auipc \
+	rv32ui-p-fence_i \
+	rv32ui-p-sb \
+	rv32ui-p-sh \
+	rv32ui-p-sw \
+	rv32ui-p-and \
+	rv32ui-p-andi \
+	rv32ui-p-beq \
+	rv32ui-p-bge \
+	rv32ui-p-bgeu \
+	rv32ui-p-blt \
+	rv32ui-p-bltu \
+	rv32ui-p-bne \
+	rv32ui-p-jal \
+	rv32ui-p-jalr \
+	rv32ui-p-lb \
+	rv32ui-p-lbu \
+	rv32ui-p-lh \
+	rv32ui-p-lhu \
+	rv32ui-p-lui \
+	rv32ui-p-lw \
+	rv32ui-p-or \
+	rv32ui-p-ori \
+	rv32ui-p-sll \
+	rv32ui-p-slli \
+	rv32ui-p-slt \
+	rv32ui-p-slti \
+	rv32ui-p-sra \
+	rv32ui-p-srai \
+	rv32ui-p-sub \
+	rv32ui-p-xor \
+	rv32ui-p-xori \
+	rv32mi-p-sbreak \
+	rv32mi-p-scall \
+	rv32mi-p-ma_fetch \
+	rv32mi-p-ma_addr \
+
+# Globally installed benchmarks
+global_bmarkdir = $(srcDir)/riscv-tests/benchmarks
+global_bmarks = \
+	median \
+	multiply \
+	qsort \
+	rsort \
+	towers \
+	vvadd \
+	dhrystone
+
+#--------------------------------------------------------------------
+# Run assembly tests and benchmarks
+#--------------------------------------------------------------------
+global_asm_out = $(addsuffix .out, $(global_asm_tests))
+global_asm_vcd = $(addsuffix .vcd, $(global_asm_tests))
+    
+global_bmarks_out = $(addsuffix .riscv.out, $(global_bmarks))
+global_bmarks_vcd = $(addsuffix .riscv.vcd, $(global_bmarks))
+global_bmarks_outgz = $(addsuffix .riscv.out.gz, $(global_bmarks))
+
+asm_test_timeout ?=30000
+bmark_timeout ?=1000000
+                           
+output:
+	mkdir -p $@
+
+$(addprefix output/, $(global_asm_vcd)): output/%.vcd: $(global_tstdir)/% emulator-debug
+	mkdir -p output
+	./emulator-debug -v$@ +max-cycles=$(asm_test_timeout) +verbose +loadmem=$< 2> /dev/null
+
+$(addprefix output/, $(global_asm_out)): output/%.out: $(global_tstdir)/% emulator
+	mkdir -p output
+	./emulator +max-cycles=$(asm_test_timeout) +verbose +loadmem=$< none $(disasm_exe) $@
+
+$(addprefix output/, $(global_bmarks_out)): output/%.riscv.out: $(global_bmarkdir)/%.riscv emulator
+	mkdir -p output
+	./emulator +max-cycles=$(bmark_timeout) +verbose +loadmem=$< none $(disasm_exe) $@
+	
+$(addprefix output/, $(global_bmarks_vcd)): output/%.riscv.vcd: $(global_bmarkdir)/%.riscv emulator-debug
+	mkdir -p output
+	./emulator-debug -v$@ +max-cycles=$(bmark_timeout) +verbose +loadmem=$< 2> /dev/null
+
+run-asm-tests: $(addprefix output/, $(addsuffix .out, $(global_asm_tests)))
+	@echo; perl -ne 'print "  [$$1] $$ARGV \t$$2\n" if /\*{3}(.{8})\*{3}(.*)/' $^; echo;
+
+run-bmarks-test: $(addprefix output/, $(addsuffix .riscv.out, $(global_bmarks)))
+	-@echo; perl -ne 'print "  [$$1] $$ARGV \t$$2\n" if /\*{3}(.{8})\*{3}(.*)/' $^; echo;
+
+run: run-asm-tests run-bmarks-test
+run-debug: run-asm-tests-debug run-bmarks-test-debug
+run-fast: $(addprefix output/, $(addsuffix .run, $(global_asm_tests) $(global_bmarks)))
+
